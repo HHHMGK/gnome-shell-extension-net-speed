@@ -32,10 +32,13 @@ const speedUnits = [
 ];
 // `ifb`: Created by python-based bandwidth manager "traffictoll".
 // `lxdbr`: Created by lxd container manager.
+// VPN interfaces (`tun`, `wg`, `tailscale`, `zt`...) are skipped because their
+// traffic is also counted on the physical interface.
 // Add more virtual interface prefixes here.
 const virtualIfacePrefixes = [
   "lo", "ifb", "lxdbr", "virbr", "br", "vnet", "tun", "tap", "docker", "utun",
-  "wg", "veth"
+  "wg", "veth", "vboxnet", "vmnet", "tailscale", "zt", "podman", "cni",
+  "flannel", "cali"
 ];
 
 const isVirtualIface = (name) => {
@@ -53,7 +56,7 @@ const formatSpeedWithUnit = (amount) => {
 
   let digits = 0;
   // Instead of showing 0.00123456 as 0.00, show it as 0.
-  if (amount >= 100 || amount - 0 < 0.01) {
+  if (amount >= 100 || amount < 0.01) {
     // 100 M/s, 200 K/s, 300 B/s.
     digits = 0;
   } else if (amount >= 10) {
@@ -72,6 +75,35 @@ const toSpeedString = (speed) => {
   return `↓ ${formatSpeedWithUnit(speed["down"])} ↑ ${formatSpeedWithUnit(speed["up"])}`;
 };
 
+// Parse `/proc/net/dev` into a map of interface name to byte counters.
+//
+// Lines look like `  eth0: 123 456 ...`. Interface names may contain `-`, `.`
+// or `@` (like `br-1a2b3c` or `eth0.100`) but never `:`, so split on the first
+// `:` instead of on non-word characters. Also there may be no space between
+// `:` and the first number.
+const parseNetDev = (text) => {
+  const ifaces = new Map();
+  for (const line of text.split("\n")) {
+    const colon = line.indexOf(":");
+    if (colon < 0) {
+      continue;
+    }
+    const name = line.slice(0, colon).trim();
+    const fields = line.slice(colon + 1).trim().split(/\s+/);
+    // 8 receive fields, then 8 transmit fields.
+    if (name.length === 0 || fields.length < 16) {
+      continue;
+    }
+    const down = Number.parseInt(fields[0], 10);
+    const up = Number.parseInt(fields[8], 10);
+    if (Number.isNaN(down) || Number.isNaN(up)) {
+      continue;
+    }
+    ifaces.set(name, {down, up});
+  }
+  return ifaces;
+};
+
 const Indicator = GObject.registerClass(
   class Indicator extends PanelMenu.Button {
     _init() {
@@ -79,6 +111,7 @@ const Indicator = GObject.registerClass(
       super._init(0.0, "Net Speed", true);
 
       this._label = new St.Label({
+        "style_class": "netspeed-label",
         "y_align": Clutter.ActorAlign.CENTER,
         "text": toSpeedString({"down": 0, "up": 0})
       });
@@ -92,29 +125,26 @@ const Indicator = GObject.registerClass(
   });
 
 export default class NetSpeed extends Extension {
-  constructor(metadata) {
-    super(metadata);
-
-    this._metadata = metadata;
-    this._uuid = metadata.uuid;
-  }
-
   enable() {
     this._textDecoder = new TextDecoder();
-    this._lastSum = {"down": 0, "up": 0};
-    this._timeout = null;
+    this._netDevFile = Gio.File.new_for_path("/proc/net/dev");
+    // Counters of each interface and time of last sample, so we can compute
+    // per-interface deltas and handle interfaces appearing, disappearing or
+    // resetting their counters without showing huge or negative spikes.
+    this._lastIfaces = null;
+    this._lastTime = 0;
 
     this._indicator = new Indicator();
     // `role`, `indicator`, `position`, `box`.
     // `-1` is not OK for position, it will show at the right of system menu.
-    Main.panel.addToStatusArea(this._uuid, this._indicator, 0, "right");
+    Main.panel.addToStatusArea(this.uuid, this._indicator, 0, "right");
 
+    // Take an initial sample so the first refresh already shows real speed.
+    this.getCurrentNetSpeed();
     this._timeout = GLib.timeout_add_seconds(
       GLib.PRIORITY_DEFAULT, refreshInterval, () => {
-        const speed = this.getCurrentNetSpeed(refreshInterval);
-        const text = toSpeedString(speed);
-        // console.log(text);
-        this._indicator.setText(text);
+        const speed = this.getCurrentNetSpeed();
+        this._indicator.setText(toSpeedString(speed));
         // Run as loop, not once.
         return GLib.SOURCE_CONTINUE;
       }
@@ -122,61 +152,57 @@ export default class NetSpeed extends Extension {
   }
 
   disable() {
+    if (this._timeout != null) {
+      GLib.source_remove(this._timeout);
+      this._timeout = null;
+    }
     if (this._indicator != null) {
       this._indicator.destroy();
       this._indicator = null;
     }
     this._textDecoder = null;
-    this._lastSum = null;
-    if (this._timeout != null) {
-      GLib.source_remove(this._timeout);
-      this._timeout = null;
-    }
+    this._netDevFile = null;
+    this._lastIfaces = null;
   }
 
-  getCurrentNetSpeed(refreshInterval) {
+  getCurrentNetSpeed() {
     const speed = {"down": 0, "up": 0};
 
     try {
-      const inputFile = Gio.File.new_for_path("/proc/net/dev");
-      const [, content] = inputFile.load_contents(null);
-      // See <https://github.com/GNOME/gjs/blob/master/doc/ByteArray.md#tostringauint8array-encodingstringstring>.
-      //
+      const [, content] = this._netDevFile.load_contents(null);
       // `ByteArray` is deprecated with ES Module, standard JavaScript
       // `TextDecoder` should be used here.
-      //
-      // Caculate the sum of all interfaces line by line, skip table head.
-      const sum = this._textDecoder.decode(content).split("\n").map((line) => {
-        return line.trim().split(/\W+/);
-      }).filter((fields) => {
-        return fields.length > 2;
-      }).map((fields) => {
-        return {
-          "name": fields[0],
-          "down": Number.parseInt(fields[1]),
-          "up": Number.parseInt(fields[9])
-        };
-      }).filter((iface) => {
-        return !(isNaN(iface["down"]) || isNaN(iface["up"]) ||
-                 isVirtualIface(iface["name"]));
-      }).reduce((sum, iface) => {
-        return {
-          "down": sum["down"] + iface["down"],
-          "up": sum["up"] + iface["up"]
-        };
-      }, {"down": 0, "up": 0});
+      const ifaces = parseNetDev(this._textDecoder.decode(content));
+      // Timers are not precise, especially when system is busy, so measure
+      // the real elapsed time instead of assuming `refreshInterval`.
+      const now = GLib.get_monotonic_time();
 
-      if (this._lastSum["down"] === 0) {
-        this._lastSum["down"] = sum["down"];
+      if (this._lastIfaces != null) {
+        const elapsed = (now - this._lastTime) / GLib.USEC_PER_SEC;
+        let down = 0;
+        let up = 0;
+        for (const [name, iface] of ifaces) {
+          const last = this._lastIfaces.get(name);
+          // Skip new interfaces and those whose counters went backwards
+          // (re-created or reset), they will be counted from next sample.
+          if (isVirtualIface(name) || last == null) {
+            continue;
+          }
+          if (iface.down >= last.down) {
+            down += iface.down - last.down;
+          }
+          if (iface.up >= last.up) {
+            up += iface.up - last.up;
+          }
+        }
+        if (elapsed > 0) {
+          speed["down"] = down / elapsed;
+          speed["up"] = up / elapsed;
+        }
       }
-      if (this._lastSum["up"] === 0) {
-        this._lastSum["up"] = sum["up"];
-      }
 
-      speed["down"] = (sum["down"] - this._lastSum["down"]) / refreshInterval;
-      speed["up"] = (sum["up"] - this._lastSum["up"]) / refreshInterval;
-
-      this._lastSum = sum;
+      this._lastIfaces = ifaces;
+      this._lastTime = now;
     } catch (e) {
       console.error(e);
     }

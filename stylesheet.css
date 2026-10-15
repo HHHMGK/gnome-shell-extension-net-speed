@@ -1,0 +1,5 @@
+/* Use tabular (fixed width) digits so the label does not jitter when numbers
+ * change. */
+.netspeed-label {
+  font-feature-settings: "tnum";
+}

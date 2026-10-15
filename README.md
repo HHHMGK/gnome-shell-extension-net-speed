@@ -11,9 +11,12 @@ It only shows text like `↓ 777 K/s ↑ 2.33 K/s` on the right part of panel. N
 # Usage
 
 ```
-$ git clone https://github.com/AlynxZhou/gnome-shell-extension-net-speed.git ~/.local/share/gnome-shell/extensions/netspeed@alynx.one
+$ git clone https://github.com/AlynxZhou/gnome-shell-extension-net-speed.git
+$ cd gnome-shell-extension-net-speed
+$ gnome-extensions pack --force
+$ gnome-extensions install --force netspeed@alynx.one.shell-extension.zip
 ```
 
 or install it from <https://extensions.gnome.org/extension/4478/net-speed/>.
 
-Then restart GNOME Shell and enable Net Speed from GNOME Extensions.
+Then log out and log in again (GNOME Shell on Wayland cannot be restarted in place), and enable Net Speed with `gnome-extensions enable netspeed@alynx.one` or from GNOME Extensions.
